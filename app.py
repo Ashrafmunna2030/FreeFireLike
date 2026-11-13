@@ -11,9 +11,15 @@ import like_pb2
 import like_count_pb2
 import uid_generator_pb2
 from google.protobuf.message import DecodeError
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
+
+# ============================================================
+# 🔑 TOKEN LOADER (unchanged)
+# ============================================================
 def xpopu_load_tokens(server_name):
     try:
         if server_name == "IND":
@@ -30,6 +36,51 @@ def xpopu_load_tokens(server_name):
         app.logger.error(f"Error loading tokens for server {server_name}: {e}")
         return None
 
+
+# ============================================================
+# 🆕 TOKEN MODE PARSER
+# ============================================================
+def parse_uid_and_mode(raw_uid):
+    """
+    Parse uid suffix:
+      uid&100 -> (uid, "half")    -> first 50% tokens
+      uid&200 -> (uid, "full")    -> all tokens
+      uid     -> (uid, "full")    -> default = full (backward compatible)
+    """
+    if not raw_uid:
+        return raw_uid, "full"
+
+    raw = raw_uid.strip()
+
+    if raw.endswith("&100"):
+        return raw[:-4], "half"
+    if raw.endswith("&200"):
+        return raw[:-4], "full"
+
+    return raw, "full"
+
+
+def xpopu_apply_token_mode(tokens, mode):
+    """
+    mode == "half" -> return first 50% of tokens
+    mode == "full" -> return all tokens
+    """
+    if not tokens:
+        return tokens
+
+    if mode == "half":
+        half_len = max(1, len(tokens) // 2)   # at least 1 token
+        selected = tokens[:half_len]
+        app.logger.info(f"[TOKEN MODE] half -> using {len(selected)}/{len(tokens)} tokens")
+        return selected
+
+    app.logger.info(f"[TOKEN MODE] full -> using {len(tokens)} tokens")
+    return tokens
+
+
+# ============================================================
+# 🔒 ENCRYPTION (unchanged)
+# ============================================================
 def xpopu_encrypt_message(plaintext):
     try:
         key = b'Yg&tc%DEuh6%Zc^8'
@@ -42,6 +93,7 @@ def xpopu_encrypt_message(plaintext):
         app.logger.error(f"Error encrypting message: {e}")
         return None
 
+
 def xpopu_create_protobuf_message(user_id, region):
     try:
         message = like_pb2.like()
@@ -52,6 +104,10 @@ def xpopu_create_protobuf_message(user_id, region):
         app.logger.error(f"Error creating protobuf message: {e}")
         return None
 
+
+# ============================================================
+# 🌐 ASYNC LIKE REQUESTS (updated to accept token_mode)
+# ============================================================
 async def xpopu_send_request(encrypted_uid, token, url):
     try:
         edata = bytes.fromhex(encrypted_uid)
@@ -76,7 +132,8 @@ async def xpopu_send_request(encrypted_uid, token, url):
         app.logger.error(f"Exception in send_request: {e}")
         return None
 
-async def xpopu_send_multiple_requests(uid, server_name, url):
+
+async def xpopu_send_multiple_requests(uid, server_name, url, token_mode="full"):
     try:
         region = server_name
         protobuf_message = xpopu_create_protobuf_message(uid, region)
@@ -87,20 +144,30 @@ async def xpopu_send_multiple_requests(uid, server_name, url):
         if encrypted_uid is None:
             app.logger.error("Encryption failed.")
             return None
-        tasks = []
+
         tokens = xpopu_load_tokens(server_name)
         if tokens is None:
             app.logger.error("Failed to load tokens.")
             return None
+
+        # 🔑 Apply token mode here (&100 / &200)
+        tokens = xpopu_apply_token_mode(tokens, token_mode)
+
+        tasks = []
         for i in range(220):
             token = tokens[i % len(tokens)]["token"]
             tasks.append(xpopu_send_request(encrypted_uid, token, url))
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return results
     except Exception as e:
         app.logger.error(f"Exception in send_multiple_requests: {e}")
         return None
 
+
+# ============================================================
+# 🧩 UID PROTOBUF (unchanged)
+# ============================================================
 def xpopu_create_protobuf(uid):
     try:
         message = uid_generator_pb2.uid_generator()
@@ -111,13 +178,17 @@ def xpopu_create_protobuf(uid):
         app.logger.error(f"Error creating uid protobuf: {e}")
         return None
 
+
 def xpopu_enc(uid):
     protobuf_data = xpopu_create_protobuf(uid)
     if protobuf_data is None:
         return None
-    encrypted_uid = xpopu_encrypt_message(protobuf_data)
-    return encrypted_uid
+    return xpopu_encrypt_message(protobuf_data)
 
+
+# ============================================================
+# 📡 SYNC PLAYER INFO REQUEST (unchanged)
+# ============================================================
 def xpopu_make_request(encrypt, server_name, token):
     try:
         if server_name == "IND":
@@ -126,6 +197,7 @@ def xpopu_make_request(encrypt, server_name, token):
             url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
         else:
             url = "https://clientbp.ppmainecoonghj.com/GetPlayerPersonalShow"
+
         edata = bytes.fromhex(encrypt)
         headers = {
             'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -139,15 +211,12 @@ def xpopu_make_request(encrypt, server_name, token):
             'ReleaseVersion': "OB55"
         }
         response = requests.post(url, data=edata, headers=headers, verify=False)
-        hex_data = response.content.hex()
-        binary = bytes.fromhex(hex_data)
-        decode = xpopu_decode_protobuf(binary)
-        if decode is None:
-            app.logger.error("Protobuf decoding returned None.")
-        return decode
+        binary = response.content
+        return xpopu_decode_protobuf(binary)
     except Exception as e:
         app.logger.error(f"Error in make_request: {e}")
         return None
+
 
 def xpopu_decode_protobuf(binary):
     try:
@@ -161,23 +230,36 @@ def xpopu_decode_protobuf(binary):
         app.logger.error(f"Unexpected error during protobuf decoding: {e}")
         return None
 
+
+# ============================================================
+# 🚀 MAIN ROUTE (updated with &100 / &200)
+# ============================================================
 @app.route('/like', methods=['GET'])
 def xpopu_handle_requests():
-    uid = request.args.get("uid")
+    raw_uid = request.args.get("uid", "").strip()
     server_name = request.args.get("server_name", "").upper()
-    if not uid or not server_name:
+
+    if not raw_uid or not server_name:
         return jsonify({"error": "UID and server_name are required"}), 400
+
+    # 🔑 Parse &100 / &200 suffix
+    uid, token_mode = parse_uid_and_mode(raw_uid)
+
+    if not uid:
+        return jsonify({"error": "Invalid UID format"}), 400
 
     try:
         def xpopu_process_request():
             tokens = xpopu_load_tokens(server_name)
             if tokens is None:
                 raise Exception("Failed to load tokens.")
+
             token = tokens[0]['token']
             encrypted_uid = xpopu_enc(uid)
             if encrypted_uid is None:
                 raise Exception("Encryption of UID failed.")
 
+            # Before
             before = xpopu_make_request(encrypted_uid, server_name, token)
             if before is None:
                 raise Exception("Failed to retrieve initial player info.")
@@ -193,6 +275,7 @@ def xpopu_handle_requests():
                 before_like = 0
             app.logger.info(f"Likes before command: {before_like}")
 
+            # Like endpoint
             if server_name == "IND":
                 url = "https://client.ind.freefiremobile.com/LikeProfile"
             elif server_name in {"BR", "US", "SAC", "NA"}:
@@ -200,8 +283,10 @@ def xpopu_handle_requests():
             else:
                 url = "https://clientbp.ppmainecoonghj.com/LikeProfile"
 
-            asyncio.run(xpopu_send_multiple_requests(uid, server_name, url))
+            # 🔑 Pass token_mode into async sender
+            asyncio.run(xpopu_send_multiple_requests(uid, server_name, url, token_mode))
 
+            # After
             after = xpopu_make_request(encrypted_uid, server_name, token)
             if after is None:
                 raise Exception("Failed to retrieve player info after like requests.")
@@ -213,23 +298,26 @@ def xpopu_handle_requests():
             after_like = int(data_after.get('AccountInfo', {}).get('Likes', 0))
             player_uid = int(data_after.get('AccountInfo', {}).get('UID', 0))
             player_name = str(data_after.get('AccountInfo', {}).get('PlayerNickname', ''))
+
             like_given = after_like - before_like
             status = 1 if like_given != 0 else 2
-            result = {
+
+            return {
                 "LikesGivenByAPI": like_given,
                 "LikesafterCommand": after_like,
                 "LikesbeforeCommand": before_like,
                 "PlayerNickname": player_name,
                 "UID": player_uid,
-                "status": status
+                "status": status,
+                "TokenMode": token_mode   # 🆕 debug info
             }
-            return result
 
         result = xpopu_process_request()
         return jsonify(result)
     except Exception as e:
         app.logger.error(f"Error processing request: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, use_reloader=False)
