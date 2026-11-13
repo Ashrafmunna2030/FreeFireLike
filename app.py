@@ -18,7 +18,7 @@ app = Flask(__name__)
 
 
 # ============================================================
-# 🔑 TOKEN LOADER (unchanged)
+# 🔑 TOKEN LOADER
 # ============================================================
 def xpopu_load_tokens(server_name):
     try:
@@ -38,48 +38,33 @@ def xpopu_load_tokens(server_name):
 
 
 # ============================================================
-# 🆕 TOKEN MODE PARSER
+# 🆕 TOKEN MODE HELPERS
 # ============================================================
-def parse_uid_and_mode(raw_uid):
-    """
-    Parse uid suffix:
-      uid&100 -> (uid, "half")    -> first 50% tokens
-      uid&200 -> (uid, "full")    -> all tokens
-      uid     -> (uid, "full")    -> default = full (backward compatible)
-    """
-    if not raw_uid:
-        return raw_uid, "full"
-
-    raw = raw_uid.strip()
-
-    if raw.endswith("&100"):
-        return raw[:-4], "half"
-    if raw.endswith("&200"):
-        return raw[:-4], "full"
-
-    return raw, "full"
-
-
 def xpopu_apply_token_mode(tokens, mode):
     """
-    mode == "half" -> return first 50% of tokens
-    mode == "full" -> return all tokens
+    mode == "half" -> first 50% of tokens
+    mode == "full" -> all tokens
     """
     if not tokens:
         return tokens
 
     if mode == "half":
-        half_len = max(1, len(tokens) // 2)   # at least 1 token
+        half_len = max(1, len(tokens) // 2)
         selected = tokens[:half_len]
-        app.logger.info(f"[TOKEN MODE] half -> using {len(selected)}/{len(tokens)} tokens")
+        app.logger.info(f"[TOKEN MODE] half -> {len(selected)}/{len(tokens)} tokens")
         return selected
 
-    app.logger.info(f"[TOKEN MODE] full -> using {len(tokens)} tokens")
+    app.logger.info(f"[TOKEN MODE] full -> {len(tokens)} tokens")
     return tokens
 
 
+def xpopu_request_count(mode):
+    """Half mode = 110 requests, Full mode = 220 requests."""
+    return 110 if mode == "half" else 220
+
+
 # ============================================================
-# 🔒 ENCRYPTION (unchanged)
+# 🔒 ENCRYPTION
 # ============================================================
 def xpopu_encrypt_message(plaintext):
     try:
@@ -106,7 +91,7 @@ def xpopu_create_protobuf_message(user_id, region):
 
 
 # ============================================================
-# 🌐 ASYNC LIKE REQUESTS (updated to accept token_mode)
+# 🌐 ASYNC LIKE REQUESTS
 # ============================================================
 async def xpopu_send_request(encrypted_uid, token, url):
     try:
@@ -140,6 +125,7 @@ async def xpopu_send_multiple_requests(uid, server_name, url, token_mode="full")
         if protobuf_message is None:
             app.logger.error("Failed to create protobuf message.")
             return None
+
         encrypted_uid = xpopu_encrypt_message(protobuf_message)
         if encrypted_uid is None:
             app.logger.error("Encryption failed.")
@@ -150,11 +136,17 @@ async def xpopu_send_multiple_requests(uid, server_name, url, token_mode="full")
             app.logger.error("Failed to load tokens.")
             return None
 
-        # 🔑 Apply token mode here (&100 / &200)
+        # 🔑 Apply token mode
         tokens = xpopu_apply_token_mode(tokens, token_mode)
+        if not tokens:
+            app.logger.error("No tokens selected after mode filtering.")
+            return None
+
+        count = xpopu_request_count(token_mode)
+        app.logger.info(f"[REQUESTS] sending {count} like requests (mode={token_mode})")
 
         tasks = []
-        for i in range(220):
+        for i in range(count):
             token = tokens[i % len(tokens)]["token"]
             tasks.append(xpopu_send_request(encrypted_uid, token, url))
 
@@ -166,7 +158,7 @@ async def xpopu_send_multiple_requests(uid, server_name, url, token_mode="full")
 
 
 # ============================================================
-# 🧩 UID PROTOBUF (unchanged)
+# 🧩 UID PROTOBUF
 # ============================================================
 def xpopu_create_protobuf(uid):
     try:
@@ -187,7 +179,7 @@ def xpopu_enc(uid):
 
 
 # ============================================================
-# 📡 SYNC PLAYER INFO REQUEST (unchanged)
+# 📡 SYNC PLAYER INFO REQUEST
 # ============================================================
 def xpopu_make_request(encrypt, server_name, token):
     try:
@@ -211,8 +203,7 @@ def xpopu_make_request(encrypt, server_name, token):
             'ReleaseVersion': "OB55"
         }
         response = requests.post(url, data=edata, headers=headers, verify=False)
-        binary = response.content
-        return xpopu_decode_protobuf(binary)
+        return xpopu_decode_protobuf(response.content)
     except Exception as e:
         app.logger.error(f"Error in make_request: {e}")
         return None
@@ -232,21 +223,37 @@ def xpopu_decode_protobuf(binary):
 
 
 # ============================================================
-# 🚀 MAIN ROUTE (updated with &100 / &200)
+# 🚀 MAIN ROUTE
 # ============================================================
 @app.route('/like', methods=['GET'])
 def xpopu_handle_requests():
+    # 🆕 Read raw query string to preserve "&100" / "&200"
+    raw_qs = request.query_string.decode('utf-8', errors='ignore')
+
     raw_uid = request.args.get("uid", "").strip()
     server_name = request.args.get("server_name", "").upper()
 
-    if not raw_uid or not server_name:
+    # 🔑 Detect token mode from RAW query string
+    token_mode = "full"  # default
+    if "&100" in raw_qs or raw_uid.endswith("&100"):
+        token_mode = "half"
+    elif "&200" in raw_qs or raw_uid.endswith("&200"):
+        token_mode = "full"
+
+    # Strip suffix if it leaked into uid
+    if raw_uid.endswith("&100"):
+        raw_uid = raw_uid[:-4]
+    elif raw_uid.endswith("&200"):
+        raw_uid = raw_uid[:-4]
+
+    uid = raw_uid.strip()
+
+    app.logger.info(f"[PARSE] raw_qs={raw_qs} | uid={uid} | mode={token_mode}")
+
+    if not uid or not server_name:
         return jsonify({"error": "UID and server_name are required"}), 400
-
-    # 🔑 Parse &100 / &200 suffix
-    uid, token_mode = parse_uid_and_mode(raw_uid)
-
-    if not uid:
-        return jsonify({"error": "Invalid UID format"}), 400
+    if not uid.isdigit():
+        return jsonify({"error": f"Invalid UID: {uid}"}), 400
 
     try:
         def xpopu_process_request():
@@ -283,7 +290,7 @@ def xpopu_handle_requests():
             else:
                 url = "https://clientbp.ppmainecoonghj.com/LikeProfile"
 
-            # 🔑 Pass token_mode into async sender
+            # 🔑 Send likes with mode
             asyncio.run(xpopu_send_multiple_requests(uid, server_name, url, token_mode))
 
             # After
@@ -309,7 +316,7 @@ def xpopu_handle_requests():
                 "PlayerNickname": player_name,
                 "UID": player_uid,
                 "status": status,
-                "TokenMode": token_mode   # 🆕 debug info
+                "TokenMode": token_mode
             }
 
         result = xpopu_process_request()
